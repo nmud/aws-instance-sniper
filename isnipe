@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+#
+# isnipe — EC2 capacity sniper
+# Retries StartInstances on a stopped EC2 instance until AWS frees up capacity.
+#
+# Run `isnipe --help` for options.
+
+set -o pipefail
+
+VERSION="1.0.0"
+
+# ---------------------------------------------------------------- formatting
+if [ -t 1 ]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'
+  YLW=$'\033[33m'; CYN=$'\033[36m'; INV=$'\033[7m'; RST=$'\033[0m'
+else
+  BOLD=""; DIM=""; RED=""; GRN=""; YLW=""; CYN=""; INV=""; RST=""
+fi
+
+info() { printf '%s %s\n' "${CYN}›${RST}" "$*"; }
+ok()   { printf '%s %s\n' "${GRN}✔${RST}" "$*"; }
+warn() { printf '%s %s\n' "${YLW}⚠${RST}" "$*"; }
+err()  { printf '%s %s\n' "${RED}✘${RST}" "$*" >&2; }
+die()  { err "$@"; exit 1; }
+
+cleanup() { [ -t 1 ] && { printf '\033[?7h'; tput cnorm 2>/dev/null; }; return 0; }
+trap cleanup EXIT
+trap 'cleanup; printf "\n"; err "Interrupted."; exit 130' INT TERM
+
+# ---------------------------------------------------------------- aws helpers
+PROFILE="" REGION="" INSTANCE_ID="" DELAY="" JITTER="" IDENTITY_ARN=""
+PARGS=()
+
+awsx() { aws "${PARGS[@]}" "$@"; }                      # profile-scoped
+awsr() { aws "${PARGS[@]}" --region "$REGION" "$@"; }   # profile + region
+
+# ---------------------------------------------------------------- menu widget
+# _menu "Title" opt1 opt2 ...  → MENU_INDEX / MENU_VALUE, rc=1 on quit
+MENU_INDEX=-1
+MENU_VALUE=""
+_menu_done() { printf '\033[?7h'; tput cnorm 2>/dev/null; }
+_menu() {
+  local title="$1"; shift
+  local opts=("$@")
+  local n=${#opts[@]} idx=0 key seq i
+  [ "$n" -eq 0 ] && return 1
+  printf '%s %s\n' "${BOLD}${title}${RST}" "${DIM}(↑/↓ move · Enter select · Esc/q quit)${RST}"
+  tput civis 2>/dev/null
+  # Disable line wrap while the menu is live: a wrapped option line would throw
+  # off the cursor-up redraw math and leave duplicated lines behind.
+  printf '\033[?7l'
+  while true; do
+    for i in "${!opts[@]}"; do
+      if [ "$i" -eq "$idx" ]; then
+        printf '  %s❯ %s%s\033[K\n' "${INV}" "${opts[$i]}" "${RST}"
+      else
+        printf '    %s\033[K\n' "${opts[$i]}"
+      fi
+    done
+    IFS= read -rsn1 key || { _menu_done; return 1; }
+    if [ "$key" = $'\x1b' ]; then
+      if ! IFS= read -rsn1 -t 0.25 seq; then
+        _menu_done; return 1                          # bare Esc
+      fi
+      [ "$seq" = '[' ] || [ "$seq" = 'O' ] && IFS= read -rsn1 -t 0.25 seq
+      case "$seq" in
+        A) idx=$(( (idx - 1 + n) % n )) ;;
+        B) idx=$(( (idx + 1) % n )) ;;
+      esac
+    else
+      case "$key" in
+        "") break ;;                                  # Enter
+        k)  idx=$(( (idx - 1 + n) % n )) ;;
+        j)  idx=$(( (idx + 1) % n )) ;;
+        q)  _menu_done; return 1 ;;
+      esac
+    fi
+    printf '\033[%dA' "$n"
+  done
+  _menu_done
+  MENU_INDEX=$idx
+  MENU_VALUE="${opts[$idx]}"
+  return 0
+}
+
+# ask "Prompt" "default" → REPLY_VALUE
+REPLY_VALUE=""
+ask() {
+  local prompt="$1" def="$2" input
+  if [ -n "$def" ]; then
+    read -rp "${CYN}?${RST} ${prompt} ${DIM}[${def}]${RST}: " input
+  else
+    read -rp "${CYN}?${RST} ${prompt}: " input
+  fi
+  REPLY_VALUE="${input:-$def}"
+}
+
+# ---------------------------------------------------------------- step 1: CLI
+ensure_cli() {
+  if command -v aws >/dev/null 2>&1; then
+    local ver; ver=$(aws --version 2>&1)
+    case "$ver" in
+      aws-cli/2*) ok "AWS CLI v2 found ${DIM}(${ver%% *})${RST}" ;;
+      aws-cli/1*) warn "AWS CLI v1 detected (${ver%% *}) — isnipe works best with v2; some auth helpers may be missing." ;;
+      *)          ok "AWS CLI found." ;;
+    esac
+    return 0
+  fi
+
+  warn "AWS CLI not found — let's set up AWS CLI v2."
+  local os arch url
+  os=$(uname -s); arch=$(uname -m)
+  case "$os" in
+    Linux)
+      case "$arch" in
+        x86_64)        url="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" ;;
+        aarch64|arm64) url="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" ;;
+        *) die "Unsupported architecture '$arch'. See https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html" ;;
+      esac
+      echo
+      info "Install commands:"
+      printf '    curl -fsSL "%s" -o "$TMP/awscliv2.zip"\n    unzip -q "$TMP/awscliv2.zip" -d "$TMP"\n    sudo "$TMP/aws/install"\n' "$url"
+      echo
+      _menu "Run these commands now?" \
+        "Yes — download and install AWS CLI v2 (uses sudo)" \
+        "No — I'll install it myself" || exit 1
+      if [ "$MENU_INDEX" -eq 0 ]; then
+        command -v curl  >/dev/null 2>&1 || die "curl is required for the download — install it first (e.g. sudo apt install curl)."
+        command -v unzip >/dev/null 2>&1 || die "unzip is required — install it first (e.g. sudo apt install unzip)."
+        local tmp; tmp=$(mktemp -d) || die "mktemp failed."
+        info "Downloading..."
+        curl -fsSL "$url" -o "$tmp/awscliv2.zip" || die "Download failed."
+        unzip -q "$tmp/awscliv2.zip" -d "$tmp"   || die "Unzip failed."
+        sudo "$tmp/aws/install"                   || die "Installer failed."
+        rm -rf "$tmp"
+        command -v aws >/dev/null 2>&1 || die "'aws' still isn't on PATH — open a new shell and re-run isnipe."
+        ok "Installed: $(aws --version 2>&1)"
+        return 0
+      fi
+      ;;
+    Darwin)
+      echo
+      info "Install commands:"
+      printf '    curl -fsSL "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "$TMP/AWSCLIV2.pkg"\n    sudo installer -pkg "$TMP/AWSCLIV2.pkg" -target /\n'
+      echo
+      _menu "Run these commands now?" \
+        "Yes — download and install AWS CLI v2 (uses sudo)" \
+        "No — I'll install it myself" || exit 1
+      if [ "$MENU_INDEX" -eq 0 ]; then
+        local tmp; tmp=$(mktemp -d) || die "mktemp failed."
+        info "Downloading..."
+        curl -fsSL "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "$tmp/AWSCLIV2.pkg" || die "Download failed."
+        sudo installer -pkg "$tmp/AWSCLIV2.pkg" -target / || die "Installer failed."
+        rm -rf "$tmp"
+        command -v aws >/dev/null 2>&1 || die "'aws' still isn't on PATH — open a new shell and re-run isnipe."
+        ok "Installed: $(aws --version 2>&1)"
+        return 0
+      fi
+      ;;
+    *)
+      die "Unsupported OS '$os'. Install AWS CLI v2 manually: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+      ;;
+  esac
+  info "Install it from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html and re-run isnipe."
+  exit 1
+}
+
+# ---------------------------------------------------------------- step 2: auth
+identity_ok() {
+  IDENTITY_ARN=$(awsx sts get-caller-identity --query Arn --output text 2>/dev/null) && [ -n "$IDENTITY_ARN" ]
+}
+
+auth_success() {
+  ok "Authenticated as ${BOLD}${IDENTITY_ARN}${RST}${PROFILE:+ ${DIM}(profile: ${PROFILE})${RST}}"
+}
+
+ensure_auth() {
+  if identity_ok; then auth_success; return 0; fi
+  [ -n "$PROFILE" ] && warn "Profile '${PROFILE}' isn't authenticated."
+
+  while true; do
+    echo
+    warn "You're not authenticated with AWS yet."
+    local profiles=() opts=() out p n
+    mapfile -t profiles < <(aws configure list-profiles 2>/dev/null)
+    for p in "${profiles[@]}"; do opts+=("Use existing profile: ${p}"); done
+    opts+=("Set up a new profile with access keys  (aws configure)")
+    opts+=("Set up SSO / IAM Identity Center       (aws configure sso)")
+    opts+=("Quit")
+    _menu "How do you want to authenticate?" "${opts[@]}" || exit 1
+    n=${#profiles[@]}
+
+    if [ "$MENU_INDEX" -lt "$n" ]; then
+      # --- try an existing profile
+      PROFILE="${profiles[$MENU_INDEX]}"
+      PARGS=(--profile "$PROFILE")
+      if out=$(awsx sts get-caller-identity --query Arn --output text 2>&1); then
+        IDENTITY_ARN="$out"; auth_success; return 0
+      fi
+      if grep -qiE 'sso|token has expired|expiredtoken|refresh' <<<"$out"; then
+        warn "Profile '${PROFILE}' needs an SSO login."
+        info "Running: aws sso login --profile ${PROFILE}"
+        if aws sso login --profile "$PROFILE" && identity_ok; then
+          auth_success; return 0
+        fi
+        err "SSO login didn't complete — pick another option."
+      else
+        err "Profile '${PROFILE}' failed to authenticate:"
+        printf '  %s\n' "${DIM}$(head -2 <<<"$out")${RST}"
+      fi
+      PROFILE=""; PARGS=()
+
+    elif [ "$MENU_INDEX" -eq "$n" ]; then
+      # --- new profile via access keys
+      info "You'll need an Access Key ID + Secret Access Key (AWS console → IAM → Security credentials)."
+      ask "Name for the new profile" "default"
+      local newp="$REPLY_VALUE"
+      aws configure --profile "$newp"
+      PROFILE="$newp"; PARGS=(--profile "$newp")
+      if identity_ok; then auth_success; return 0; fi
+      err "Still not authenticated — double-check the keys."
+      PROFILE=""; PARGS=()
+
+    elif [ "$MENU_INDEX" -eq $((n + 1)) ]; then
+      # --- new profile via SSO
+      info "Running: aws configure sso ${DIM}(follow the prompts — note the profile name it creates)${RST}"
+      aws configure sso
+      ask "Profile name you just created" ""
+      if [ -n "$REPLY_VALUE" ]; then
+        PROFILE="$REPLY_VALUE"; PARGS=(--profile "$PROFILE")
+        if identity_ok || { aws sso login --profile "$PROFILE" && identity_ok; }; then
+          auth_success; return 0
+        fi
+        err "That profile didn't authenticate."
+        PROFILE=""; PARGS=()
+      fi
+
+    else
+      exit 0
+    fi
+  done
+}
+
+# ---------------------------------------------------------------- step 3: region
+ensure_region() {
+  if [ -n "$REGION" ]; then info "Region: ${BOLD}${REGION}${RST}"; return 0; fi
+  local def
+  def=$(awsx configure get region 2>/dev/null)
+  def="${def:-${AWS_DEFAULT_REGION:-us-east-1}}"
+  ask "AWS region" "$def"
+  REGION="$REPLY_VALUE"
+}
+
+# ---------------------------------------------------------------- step 4: pick instance
+pick_instance() {
+  local raw id itype az name ids opts
+  while true; do
+    info "Looking for stopped instances in ${BOLD}${REGION}${RST}..."
+    if ! raw=$(awsr ec2 describe-instances \
+        --filters "Name=instance-state-name,Values=stopped" \
+        --query 'Reservations[].Instances[].[InstanceId,InstanceType,Placement.AvailabilityZone,Tags[?Key==`Name`]|[0].Value]' \
+        --output text 2>&1); then
+      err "Couldn't list instances:"
+      printf '  %s\n' "${DIM}$(head -3 <<<"$raw")${RST}"
+      exit 1
+    fi
+
+    ids=(); opts=()
+    while IFS=$'\t' read -r id itype az name; do
+      [ -z "$id" ] && continue
+      [ "$name" = "None" ] && name="${DIM}(no name)${RST}"
+      ids+=("$id")
+      opts+=("$(printf '%-21s %-16s %-13s %s' "$id" "$itype" "$az" "$name")")
+    done <<<"$raw"
+
+    if [ "${#ids[@]}" -eq 0 ]; then
+      warn "No stopped instances found in ${REGION}."
+      _menu "What next?" "Refresh" "Change region" "Quit" || exit 1
+      case "$MENU_INDEX" in
+        0) continue ;;
+        1) REGION=""; ensure_region; continue ;;
+        *) exit 0 ;;
+      esac
+    fi
+
+    echo
+    _menu "Select the stopped instance to snipe:" "${opts[@]}" || exit 1
+    INSTANCE_ID="${ids[$MENU_INDEX]}"
+    ok "Target locked: ${BOLD}${INSTANCE_ID}${RST}"
+    return 0
+  done
+}
+
+# ---------------------------------------------------------------- step 5: tuning
+ask_tuning() {
+  if [ -z "$DELAY" ]; then
+    while true; do
+      ask "Delay between attempts, in seconds" "5"
+      if [[ "$REPLY_VALUE" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v d="$REPLY_VALUE" 'BEGIN{exit !(d >= 1)}'; then
+        DELAY="$REPLY_VALUE"; break
+      fi
+      warn "Please enter a number ≥ 1."
+    done
+  fi
+  if awk -v d="$DELAY" 'BEGIN{exit !(d < 2)}'; then
+    warn "Delays under 2s can trip EC2 request throttling — isnipe will back off automatically if that happens."
+  fi
+  if [ -z "$JITTER" ]; then
+    _menu "Add random jitter to each attempt? (±40% of delay — avoids syncing with other retry loops)" \
+      "Yes (recommended)" "No — fixed ${DELAY}s interval" || exit 1
+    if [ "$MENU_INDEX" -eq 0 ]; then JITTER=1; else JITTER=0; fi
+  fi
+}
+
+# ---------------------------------------------------------------- step 6: snipe
+# Wait $1 seconds, cancellable: rc=1 if the user pressed a bare Esc.
+snooze() {
+  local key
+  [ -t 0 ] || { sleep "$1"; return 0; }
+  while true; do
+    IFS= read -rsn1 -t "$1" key || return 0           # timed out — wait complete
+    if [ "$key" = $'\x1b' ]; then
+      IFS= read -rsn1 -t 0.05 key || return 1         # bare Esc — cancel
+      while IFS= read -rsn1 -t 0.01 key; do :; done   # arrow/function key — swallow and ignore
+    fi
+  done
+}
+
+cancelled() {
+  printf '\r\033[K'
+  warn "Cancelled after ${1} attempt(s) ($(fmt_elapsed)) — back to instance selection."
+}
+
+next_delay() {
+  if [ "$JITTER" = "1" ]; then
+    awk -v d="$DELAY" -v r="$RANDOM" 'BEGIN{ printf "%.1f", d + (r/32767 - 0.5) * 0.8 * d }'
+  else
+    printf '%s' "$DELAY"
+  fi
+}
+
+fmt_elapsed() {
+  local s=$SECONDS
+  printf '%02d:%02d:%02d' $((s / 3600)) $((s % 3600 / 60)) $((s % 60))
+}
+
+celebrate() {
+  local attempt="$1" link ip dns
+  ok "${GRN}${BOLD}🎯 Got it! Job done.${RST} ${BOLD}${INSTANCE_ID}${RST} is starting — capacity acquired on attempt #${attempt} after $(fmt_elapsed)."
+  link="https://${REGION}.console.aws.amazon.com/ec2/home?region=${REGION}#InstanceDetails:instanceId=${INSTANCE_ID}"
+  info "Console: ${link}"
+  info "Waiting for the instance to reach 'running'..."
+  if awsr ec2 wait instance-running --instance-ids "$INSTANCE_ID" 2>/dev/null; then
+    read -r ip dns < <(awsr ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+      --query 'Reservations[0].Instances[0].[PublicIpAddress,PublicDnsName]' --output text 2>/dev/null)
+    ok "Instance is ${GRN}${BOLD}running${RST}."
+    [ -n "$ip" ]  && [ "$ip"  != "None" ] && info "Public IP:  ${BOLD}${ip}${RST}"
+    [ -n "$dns" ] && [ "$dns" != "None" ] && info "Public DNS: ${dns}"
+  else
+    warn "Start succeeded, but the 'running' wait timed out — check the console link above."
+  fi
+}
+
+snipe() {
+  local attempt=0 throttles=0 out rc wait_s state
+  echo
+  info "Sniping ${BOLD}${INSTANCE_ID}${RST} in ${BOLD}${REGION}${RST} every ${DELAY}s$([ "$JITTER" = "1" ] && printf ' %s' "(jittered)"). ${DIM}Esc to cancel · Ctrl-C to quit.${RST}"
+  SECONDS=0
+
+  while true; do
+    attempt=$((attempt + 1))
+    out=$(awsr ec2 start-instances --instance-ids "$INSTANCE_ID" --output text 2>&1)
+    rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+      printf '\r\033[K\n'
+      celebrate "$attempt"
+      return 0
+    fi
+
+    case "$out" in
+      *Insufficient*Capacity*)
+        throttles=0
+        wait_s=$(next_delay)
+        printf '\r\033[K%s attempt #%d @ %s — no capacity yet, retrying in %ss %s' \
+          "${DIM}…${RST}" "$attempt" "$(date +%H:%M:%S)" "$wait_s" "${DIM}(elapsed $(fmt_elapsed))${RST}"
+        snooze "$wait_s" || { cancelled "$attempt"; return 2; }
+        ;;
+
+      *RequestLimitExceeded*|*Throttling*|*"Rate exceeded"*)
+        throttles=$((throttles + 1))
+        wait_s=$(awk -v d="$DELAY" -v t="$throttles" 'BEGIN{ b = d * (2 ^ t); if (b > 60) b = 60; printf "%.1f", b }')
+        printf '\r\033[K\n'
+        warn "Rate limited by AWS (attempt #${attempt}) — backing off ${wait_s}s before retrying."
+        [ "$throttles" -ge 3 ] && info "This keeps happening — consider a longer delay (current: ${DELAY}s)."
+        snooze "$wait_s" || { cancelled "$attempt"; return 2; }
+        ;;
+
+      *IncorrectInstanceState*)
+        state=$(awsr ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+          --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null)
+        case "$state" in
+          pending|running)
+            printf '\r\033[K\n'
+            info "Instance is already ${state} — someone (or a previous attempt) beat us to it."
+            celebrate "$attempt"
+            return 0
+            ;;
+          stopping)
+            printf '\r\033[K\n'
+            warn "Instance is still stopping — waiting ${DELAY}s for it to settle."
+            snooze "$DELAY" || { cancelled "$attempt"; return 2; }
+            ;;
+          *)
+            printf '\r\033[K\n'
+            err "Instance is in state '${state}' and can't be started. Aborting."
+            exit 1
+            ;;
+        esac
+        ;;
+
+      *ExpiredToken*|*RequestExpired*|*InvalidClientTokenId*|*AuthFailure*|*UnauthorizedOperation*|*"Unable to locate credentials"*)
+        printf '\r\033[K\n'
+        err "Credentials problem on attempt #${attempt} — stopping so you can re-authenticate:"
+        printf '  %s\n' "${DIM}$(head -3 <<<"$out")${RST}"
+        [ -n "$PROFILE" ] && info "If it's an SSO profile, try: ${BOLD}aws sso login --profile ${PROFILE}${RST} then re-run isnipe."
+        exit 1
+        ;;
+
+      *)
+        printf '\r\033[K\n'
+        err "Unexpected error on attempt #${attempt} — stopping:"
+        printf '  %s\n' "${DIM}$(head -5 <<<"$out")${RST}"
+        exit 1
+        ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- entry point
+usage() {
+  cat <<EOF
+${BOLD}isnipe${RST} v${VERSION} — EC2 capacity sniper
+
+Retries StartInstances on a stopped instance until AWS frees up capacity
+(InsufficientInstanceCapacity). Interactive by default; flags skip prompts.
+
+${BOLD}Usage:${RST} isnipe [options]
+
+${BOLD}Options:${RST}
+  -p, --profile NAME     AWS profile to use
+  -r, --region REGION    AWS region (default: profile's region)
+  -i, --instance-id ID   Skip the picker and snipe this instance
+  -d, --delay SECONDS    Delay between attempts (default: 5, min: 1)
+  -j, --jitter           Randomize each delay by ±40%
+      --no-jitter        Fixed interval
+  -V, --version          Print version
+  -h, --help             Show this help
+
+${BOLD}Examples:${RST}
+  isnipe
+  isnipe -i i-09920693e8c413d06 -r us-east-1 -d 2 -j
+EOF
+}
+
+banner() {
+  printf '%s %s\n\n' "${BOLD}🎯 isnipe${RST}" "${DIM}v${VERSION} — EC2 capacity sniper${RST}"
+}
+
+main() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p|--profile)     [ $# -ge 2 ] || die "$1 requires a value"; PROFILE="$2"; PARGS=(--profile "$2"); shift 2 ;;
+      -r|--region)      [ $# -ge 2 ] || die "$1 requires a value"; REGION="$2"; shift 2 ;;
+      -i|--instance-id) [ $# -ge 2 ] || die "$1 requires a value"; INSTANCE_ID="$2"; shift 2 ;;
+      -d|--delay)       [ $# -ge 2 ] || die "$1 requires a value"; DELAY="$2"; shift 2 ;;
+      -j|--jitter)      JITTER=1; shift ;;
+      --no-jitter)      JITTER=0; shift ;;
+      -V|--version)     echo "isnipe ${VERSION}"; exit 0 ;;
+      -h|--help)        usage; exit 0 ;;
+      *)                err "Unknown option: $1"; echo; usage; exit 1 ;;
+    esac
+  done
+
+  if [ -n "$DELAY" ]; then
+    [[ "$DELAY" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v d="$DELAY" 'BEGIN{exit !(d >= 1)}' \
+      || die "--delay must be a number ≥ 1."
+  fi
+  if [ -n "$INSTANCE_ID" ] && ! [[ "$INSTANCE_ID" =~ ^i-[0-9a-f]{8,17}$ ]]; then
+    die "'$INSTANCE_ID' doesn't look like an instance ID (expected i-xxxxxxxxxxxxxxxxx)."
+  fi
+
+  banner
+  ensure_cli
+  ensure_auth
+  ensure_region
+  while true; do
+    [ -z "$INSTANCE_ID" ] && pick_instance
+    ask_tuning
+    snipe && break        # rc=2 means cancelled with Esc — back to the picker
+    INSTANCE_ID=""
+    echo
+  done
+}
+
+# Run main only when executed, not sourced (lets tests source the functions).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
