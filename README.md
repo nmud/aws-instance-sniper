@@ -8,13 +8,26 @@ isnipe walks you through installing and authenticating.
 
 ## Install
 
-Drop the script anywhere on your `PATH`:
+**Homebrew** (macOS / Linux):
+
+```bash
+brew install nmud/tap/isnipe
+```
+
+**curl**:
+
+```bash
+mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/nmud/aws-instance-sniper/main/isnipe -o ~/.local/bin/isnipe && chmod +x ~/.local/bin/isnipe
+```
+
+**From a clone**, drop the script anywhere on your `PATH`:
 
 ```bash
 install -m 755 isnipe ~/.local/bin/
 ```
 
-Requires bash ≥ 4 (macOS ships 3.2 — `brew install bash` first).
+Requires bash ≥ 4 (macOS ships 3.2 — `brew install bash` first; the Homebrew
+package takes care of this for you).
 
 ## Usage
 
