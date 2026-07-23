@@ -8,16 +8,12 @@ EC2 API directly, so there's **nothing to install at runtime** — not even the
 AWS CLI. (If the AWS CLI happens to be installed, isnipe can use it to walk you
 through first-time credential setup; it's never required.)
 
-> **Note:** prebuilt binaries and `go install …@latest` become available once a
-> `v2.x` release is tagged. From an unreleased checkout, use **Build from
-> source** below (or `go install …@main`).
-
 ## Install
 
 ### `go install` (any OS with Go ≥ 1.21)
 
 ```bash
-go install github.com/nmud/aws-instance-sniper/cmd/isnipe@latest
+go install github.com/nmud/aws-instance-sniper/v2/cmd/isnipe@latest
 ```
 
 Installs `isnipe` into `$(go env GOPATH)/bin` — make sure that's on your `PATH`.

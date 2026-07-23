@@ -1,4 +1,4 @@
-module github.com/nmud/aws-instance-sniper
+module github.com/nmud/aws-instance-sniper/v2
 
 go 1.25.0
 
