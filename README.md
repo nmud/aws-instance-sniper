@@ -8,12 +8,6 @@ isnipe walks you through installing and authenticating.
 
 ## Install
 
-**Homebrew** (macOS / Linux):
-
-```bash
-brew install nmud/tap/isnipe
-```
-
 **curl**:
 
 ```bash
@@ -26,8 +20,7 @@ mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/nmud/aws-i
 install -m 755 isnipe ~/.local/bin/
 ```
 
-Requires bash ≥ 4 (macOS ships 3.2 — `brew install bash` first; the Homebrew
-package takes care of this for you).
+Requires bash ≥ 4 (macOS ships 3.2 — `brew install bash` first).
 
 ## Usage
 
